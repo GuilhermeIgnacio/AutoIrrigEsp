@@ -8,9 +8,9 @@
 #include "controle_bomba.h"
 
 // --- Configurações de Rede ---
-const char* SSID = "NOME_REDE_WIFI"; // Nome do Wifi a contectar (mudar)
-const char* PASSWORD = "SENHA_REDE_WIFI"; // Senha o Wifi a contectar mudar)
-const char* SERVER_URL = "http://Saeko.pythonanywhere.com"; // Apontamento pythonanywhere.com (mudar)
+const char* SSID = "guilherme_2G"; // Nome do Wifi a contectar (mudar)
+const char* PASSWORD = "789453216a"; // Senha o Wifi a contectar mudar)
+const char* SERVER_URL = "https://auto-irrig-default-rtdb.firebaseio.com/"; // Apontamento Firebase (mudar)
 
 // --- NOVAS VARIÁVEIS PARA CONTROLE MANUAL ---
 bool manual_irrigation_active[] = {false, false};
@@ -157,7 +157,8 @@ void logica_irrigacao() {
 
 void enviar_telemetria() {
     HTTPClient http;
-    String serverPath = String(SERVER_URL) + "/post_data";
+    // Use um nó fixo para sobrescrever os dados
+    String serverPath = String(SERVER_URL) + "/telemetry.json"; // Nó fixo: /telemetry
     http.begin(serverPath);
     http.addHeader("Content-Type", "application/json");
 
@@ -167,13 +168,22 @@ void enviar_telemetria() {
     JsonArray umidadeSoloArray = doc["umidadeSolo"].to<JsonArray>();
     umidadeSoloArray.add(lerUmidadePercentual(PINO_UMIDADE_SOLO_1));
     umidadeSoloArray.add(lerUmidadePercentual(PINO_UMIDADE_SOLO_2));
+    // Adicione um timestamp para rastrear a última atualização (opcional)
+    doc["timestamp"] = millis();
 
     String output;
     serializeJson(doc, output);
 
-    int httpResponseCode = http.POST(output);
+    // Use PUT em vez de POST para sobrescrever
+    int httpResponseCode = http.PUT(output);
     Serial.print("Enviando telemetria... Código de resposta HTTP: ");
     Serial.println(httpResponseCode);
+    if (httpResponseCode > 0) {
+        Serial.println("Telemetria atualizada com sucesso!");
+    } else {
+        Serial.print("Erro ao enviar telemetria: ");
+        Serial.println(http.errorToString(httpResponseCode));
+    }
     http.end();
 }
 
