@@ -8,19 +8,35 @@
 #include "controle_bomba.h"
 
 // --- Configurações de Rede ---
-const char* SSID = "guilherme_2G"; // Nome do Wifi a contectar (mudar)
-const char* PASSWORD = "789453216a"; // Senha o Wifi a contectar mudar)
-const char* SERVER_URL = "https://auto-irrig-default-rtdb.firebaseio.com/"; // Apontamento Firebase (mudar)
+const char* SSID = "guilherme_2G";
+const char* PASSWORD = "789453216a";
+const char* SERVER_URL = "https://auto-irrig-default-rtdb.firebaseio.com";
 
-// --- NOVAS VARIÁVEIS PARA CONTROLE MANUAL ---
-bool manual_irrigation_active[] = {false, false};
-unsigned long manual_irrigation_start_time[] = {0, 0};
-const unsigned long MANUAL_IRRIGATION_DURATION = 3000; // 3s para acionar a bomba manualmente
+// --- Intervalos Otimizados ---
+const unsigned long TELEMETRIA_INTERVAL = 10000; // 10s em vez de 5s (reduz tráfego)
+const unsigned long COMANDO_INTERVAL = 3000;     // 3s para comandos (mais responsivo)
+const unsigned long LOGICA_INTERVAL = 2000;      // 2s para lógica local
 
-// --- Variáveis de Lógica de Irrigação ---
-int min_umidade[] = {30, 30};
-int max_umidade[] = {60, 60};
-bool bomba_ligada[] = {false, false};
+// --- Controle de Estado ---
+struct SystemState {
+    int min_umidade[2] = {30, 30};
+    int max_umidade[2] = {60, 60};
+    bool bomba_ligada[2] = {false, false};
+    bool manual_irrigation_active[2] = {false, false};
+    unsigned long manual_irrigation_start_time[2] = {0, 0};
+    
+    // Cache de telemetria para evitar envios duplicados
+    float last_temperatura = -999;
+    float last_umidadeAr = -999;
+    int last_umidadeSolo[2] = {-1, -1};
+    
+    // Timestamp do último comando processado
+    String last_command_id = "";
+};
+
+SystemState state;
+
+const unsigned long MANUAL_IRRIGATION_DURATION = 3000;
 
 // --- Mapeamento de Pinos ---
 const int PINO_UMIDADE_SOLO_1 = 34;
@@ -28,12 +44,13 @@ const int PINO_UMIDADE_SOLO_2 = 35;
 const int PINO_BOMBA_1 = 26;
 const int PINO_BOMBA_2 = 27;
 
-// --- Protótipos de Funções ---
+// --- Protótipos ---
 void setup_wifi();
-void enviar_telemetria();
-void verificar_comandos();
-void handle_manual_irrigation(); // <-- NOVA FUNÇÃO
+bool enviar_telemetria_otimizada();
+void verificar_comandos_otimizado();
+void handle_manual_irrigation();
 void logica_irrigacao();
+bool dados_telemetria_mudaram();
 
 void setup() {
     Serial.begin(115200);
@@ -45,158 +62,244 @@ void setup() {
 }
 
 void loop() {
-    static unsigned long last_sync_time = 0;
+    static unsigned long last_telemetry_time = 0;
+    static unsigned long last_command_time = 0;
     static unsigned long last_logic_time = 0;
 
-    // A cada 5 segundos, sincroniza com o servidor
-    if (millis() - last_sync_time > 5000) {
-        last_sync_time = millis();
+    unsigned long now = millis();
+
+    // Verifica comandos com intervalo menor (mais responsivo)
+    if (now - last_command_time > COMANDO_INTERVAL) {
+        last_command_time = now;
         if (WiFi.status() == WL_CONNECTED) {
-            enviar_telemetria();
-            verificar_comandos();
+            verificar_comandos_otimizado();
         } else {
             Serial.println("WiFi desconectado. Tentando reconectar...");
             setup_wifi();
         }
     }
 
-    // A cada 1 segundo, verifica a lógica (automática e manual)
-    if (millis() - last_logic_time > 1000) {
-        last_logic_time = millis();
-        handle_manual_irrigation(); 
-        logica_irrigacao();         
+    // Envia telemetria apenas se houver mudanças significativas
+    if (now - last_telemetry_time > TELEMETRIA_INTERVAL) {
+        last_telemetry_time = now;
+        if (WiFi.status() == WL_CONNECTED && dados_telemetria_mudaram()) {
+            enviar_telemetria_otimizada();
+        }
+    }
+
+    // Lógica local roda com mais frequência
+    if (now - last_logic_time > LOGICA_INTERVAL) {
+        last_logic_time = now;
+        handle_manual_irrigation();
+        logica_irrigacao();
     }
 }
 
-// --- Implementação das Funções ---
+// --- Verifica se dados mudaram significativamente ---
+bool dados_telemetria_mudaram() {
+    float temp = getTemperature();
+    float umid_ar = getAirHumidity();
+    int umid_solo1 = lerUmidadePercentual(PINO_UMIDADE_SOLO_1);
+    int umid_solo2 = lerUmidadePercentual(PINO_UMIDADE_SOLO_2);
+    
+    // Margem de 1% para temperatura/umidade ar, 2% para solo
+    bool mudou = (abs(temp - state.last_temperatura) > 1.0) ||
+                 (abs(umid_ar - state.last_umidadeAr) > 1.0) ||
+                 (abs(umid_solo1 - state.last_umidadeSolo[0]) > 2) ||
+                 (abs(umid_solo2 - state.last_umidadeSolo[1]) > 2);
+    
+    if (mudou) {
+        state.last_temperatura = temp;
+        state.last_umidadeAr = umid_ar;
+        state.last_umidadeSolo[0] = umid_solo1;
+        state.last_umidadeSolo[1] = umid_solo2;
+    }
+    
+    return mudou;
+}
 
-void verificar_comandos() {
+// --- Telemetria Otimizada (PATCH em vez de PUT) ---
+bool enviar_telemetria_otimizada() {
     HTTPClient http;
-    String serverPath = String(SERVER_URL) + "/get_command";
-    http.begin(serverPath);
-
-    int httpResponseCode = http.GET();
-    if (httpResponseCode == 200) {
-        String payload = http.getString();
-        Serial.print("Comando recebido: ");
-        Serial.println(payload);
-
-        JsonDocument doc;
-        deserializeJson(doc, payload);
-
-        if (!doc.isNull() && doc["type"]) {
-            const char* type = doc["type"];
-            if (strcmp(type, "config") == 0) {
-                // Lógica de configuração (sem alterações)
-                min_umidade[0] = doc["payload"]["min_umidade"][0];
-                max_umidade[0] = doc["payload"]["max_umidade"][0];
-                min_umidade[1] = doc["payload"]["min_umidade"][1];
-                max_umidade[1] = doc["payload"]["max_umidade"][1];
-                Serial.println("Configurações de umidade atualizadas!");
-
-            } else if (strcmp(type, "manual_irrigate") == 0) {
-                // --- LÓGICA MANUAL ATUALIZADA ---
-                int bomba = doc["payload"];
-                if (bomba == 1 || bomba == 2) {
-                    int index = bomba - 1;
-                    // Só inicia se não houver um ciclo manual já ativo para essa bomba
-                    if (!manual_irrigation_active[index]) {
-                        Serial.printf("Iniciando irrigacao manual para bomba %d por 3 segundos.\n", bomba);
-                        manual_irrigation_active[index] = true;
-                        manual_irrigation_start_time[index] = millis();
-                        controlarBomba(bomba, true);
-                        bomba_ligada[index] = true;
-                    }
-                }
-            }
-        }
-    } else {
-        Serial.printf("Erro ao verificar comandos. Código HTTP: %d\n", httpResponseCode);
-    }
-    http.end();
-}
-
-// --- NOVA FUNÇÃO PARA GERENCIAR O TEMPORIZADOR MANUAL ---
-void handle_manual_irrigation() {
-    for (int i = 0; i < 2; i++) {
-        // Se a bomba 'i' está em modo manual...
-        if (manual_irrigation_active[i]) {
-            // E se já passaram 3 segundos...
-            if (millis() - manual_irrigation_start_time[i] >= MANUAL_IRRIGATION_DURATION) {
-                int bomba_num = i + 1;
-                Serial.printf("Irrigacao manual para bomba %d finalizada.\n", bomba_num);
-                controlarBomba(bomba_num, false); // Desliga a bomba
-                bomba_ligada[i] = false;           // Sincroniza o estado
-                manual_irrigation_active[i] = false; // Retorna ao modo automático
-            }
-        }
-    }
-}
-
-// --- LÓGICA DE IRRIGAÇÃO AUTOMÁTICA ---
-void logica_irrigacao() {
-    int umidade_atual[] = {lerUmidadePercentual(PINO_UMIDADE_SOLO_1), lerUmidadePercentual(PINO_UMIDADE_SOLO_2)};
-    for (int i = 0; i < 2; i++) {
-        // SÓ executa a lógica automática se a bomba NÃO estiver em modo manual
-        if (!manual_irrigation_active[i]) {
-            int bomba_num = i + 1;
-            // Se a umidade está abaixo do mínimo E a bomba está desligada...
-            if (umidade_atual[i] < min_umidade[i] && !bomba_ligada[i]) {
-                controlarBomba(bomba_num, true);
-                bomba_ligada[i] = true;
-            } 
-            // Se a umidade está acima do máximo E a bomba está ligada...
-            else if (umidade_atual[i] >= max_umidade[i] && bomba_ligada[i]) {
-                controlarBomba(bomba_num, false);
-                bomba_ligada[i] = false;
-            }
-        }
-    }
-}
-
-
-void enviar_telemetria() {
-    HTTPClient http;
-    // Use um nó fixo para sobrescrever os dados
-    String serverPath = String(SERVER_URL) + "/telemetry.json"; // Nó fixo: /telemetry
+    String serverPath = String(SERVER_URL) + "/telemetry.json";
     http.begin(serverPath);
     http.addHeader("Content-Type", "application/json");
 
     JsonDocument doc;
-    doc["temperatura"] = getTemperature();
-    doc["umidadeAr"] = getAirHumidity();
+    doc["temperatura"] = state.last_temperatura;
+    doc["umidadeAr"] = state.last_umidadeAr;
     JsonArray umidadeSoloArray = doc["umidadeSolo"].to<JsonArray>();
-    umidadeSoloArray.add(lerUmidadePercentual(PINO_UMIDADE_SOLO_1));
-    umidadeSoloArray.add(lerUmidadePercentual(PINO_UMIDADE_SOLO_2));
-    // Adicione um timestamp para rastrear a última atualização (opcional)
+    umidadeSoloArray.add(state.last_umidadeSolo[0]);
+    umidadeSoloArray.add(state.last_umidadeSolo[1]);
     doc["timestamp"] = millis();
+    
+    // Adiciona status das bombas
+    JsonArray bombasArray = doc["bombas"].to<JsonArray>();
+    bombasArray.add(state.bomba_ligada[0]);
+    bombasArray.add(state.bomba_ligada[1]);
 
     String output;
     serializeJson(doc, output);
 
-    // Use PUT em vez de POST para sobrescrever
-    int httpResponseCode = http.PUT(output);
-    Serial.print("Enviando telemetria... Código de resposta HTTP: ");
-    Serial.println(httpResponseCode);
+    int httpResponseCode = http.PATCH(output); // PATCH é mais eficiente
+    
     if (httpResponseCode > 0) {
-        Serial.println("Telemetria atualizada com sucesso!");
+        Serial.println("Telemetria atualizada!");
+        http.end();
+        return true;
     } else {
-        Serial.print("Erro ao enviar telemetria: ");
-        Serial.println(http.errorToString(httpResponseCode));
+        Serial.printf("Erro telemetria: %s\n", http.errorToString(httpResponseCode).c_str());
+        http.end();
+        return false;
     }
+}
+
+// --- Verificação de Comandos Otimizada ---
+void verificar_comandos_otimizado() {
+    HTTPClient http;
+    String serverPath = String(SERVER_URL) + "/commands.json";
+    http.begin(serverPath);
+
+    int httpResponseCode = http.GET();
+    if (httpResponseCode != 200) {
+        http.end();
+        return;
+    }
+
+    String payload = http.getString();
     http.end();
+
+    if (payload == "null" || payload.length() == 0) {
+        return;
+    }
+
+    JsonDocument doc;
+    if (deserializeJson(doc, payload)) {
+        Serial.println("Erro ao parsear comando");
+        return;
+    }
+
+    // Verifica se é um comando novo usando timestamp ou ID
+    String command_id = doc["id"] | "";
+    if (command_id.length() > 0 && command_id == state.last_command_id) {
+        return; // Comando já processado
+    }
+    
+    const char* type = doc["type"];
+    if (!type) return;
+
+    Serial.printf("Processando comando: %s\n", type);
+
+    if (strcmp(type, "config") == 0) {
+        // Atualiza configurações
+        JsonArray minArray = doc["payload"]["min_umidade"].as<JsonArray>();
+        JsonArray maxArray = doc["payload"]["max_umidade"].as<JsonArray>();
+        
+        if (minArray.size() >= 2 && maxArray.size() >= 2) {
+            state.min_umidade[0] = minArray[0];
+            state.max_umidade[0] = maxArray[0];
+            state.min_umidade[1] = minArray[1];
+            state.max_umidade[1] = maxArray[1];
+            Serial.println("Config atualizada!");
+        }
+
+    } else if (strcmp(type, "manual_irrigate") == 0) {
+        int bomba = doc["bomba"];
+        if (bomba >= 1 && bomba <= 2) {
+            int index = bomba - 1;
+            if (!state.manual_irrigation_active[index]) {
+                Serial.printf("Irrigacao manual bomba %d\n", bomba);
+                state.manual_irrigation_active[index] = true;
+                state.manual_irrigation_start_time[index] = millis();
+                controlarBomba(bomba, true);
+                state.bomba_ligada[index] = true;
+            }
+        }
+    }
+
+    // Marca comando como processado
+    state.last_command_id = command_id;
+    
+    // Limpa comando do Firebase usando DELETE
+    http.begin(serverPath);
+    http.sendRequest("DELETE");
+    http.end();
+}
+
+// --- Gerenciamento de Irrigação Manual ---
+void handle_manual_irrigation() {
+    for (int i = 0; i < 2; i++) {
+        if (state.manual_irrigation_active[i]) {
+            if (millis() - state.manual_irrigation_start_time[i] >= MANUAL_IRRIGATION_DURATION) {
+                int bomba_num = i + 1;
+                Serial.printf("Fim irrigacao manual bomba %d\n", bomba_num);
+                controlarBomba(bomba_num, false);
+                state.bomba_ligada[i] = false;
+                state.manual_irrigation_active[i] = false;
+            }
+        }
+    }
+}
+
+// --- Lógica de Irrigação Automática ---
+void logica_irrigacao() {
+    int umidade_atual[] = {
+        lerUmidadePercentual(PINO_UMIDADE_SOLO_1),
+        lerUmidadePercentual(PINO_UMIDADE_SOLO_2)
+    };
+    
+    for (int i = 0; i < 2; i++) {
+        int bomba_num = i + 1;
+        
+        // LOG DETALHADO PARA DEBUG
+        Serial.printf("=== BOMBA %d ===\n", bomba_num);
+        Serial.printf("Umidade atual: %d%%\n", umidade_atual[i]);
+        Serial.printf("Min configurado: %d%%\n", state.min_umidade[i]);
+        Serial.printf("Max configurado: %d%%\n", state.max_umidade[i]);
+        Serial.printf("Manual ativo: %s\n", state.manual_irrigation_active[i] ? "SIM" : "NAO");
+        Serial.printf("Bomba ligada: %s\n", state.bomba_ligada[i] ? "SIM" : "NAO");
+        
+        if (!state.manual_irrigation_active[i]) {
+            // Verifica se precisa ligar
+            if (umidade_atual[i] < state.min_umidade[i] && !state.bomba_ligada[i]) {
+                Serial.printf(">>> LIGANDO bomba %d (umidade %d%% < min %d%%)\n", 
+                             bomba_num, umidade_atual[i], state.min_umidade[i]);
+                controlarBomba(bomba_num, true);
+                state.bomba_ligada[i] = true;
+            } 
+            // Verifica se precisa desligar
+            else if (umidade_atual[i] >= state.max_umidade[i] && state.bomba_ligada[i]) {
+                Serial.printf(">>> DESLIGANDO bomba %d (umidade %d%% >= max %d%%)\n", 
+                             bomba_num, umidade_atual[i], state.max_umidade[i]);
+                controlarBomba(bomba_num, false);
+                state.bomba_ligada[i] = false;
+            }
+            else {
+                Serial.println(">>> Nenhuma acao necessaria");
+            }
+        } else {
+            Serial.println(">>> MODO MANUAL - logica automatica pausada");
+        }
+        Serial.println();
+    }
 }
 
 void setup_wifi() {
     delay(10);
-    Serial.println();
-    Serial.print("Conectando a ");
-    Serial.println(SSID);
+    Serial.println("\nConectando WiFi...");
     WiFi.begin(SSID, PASSWORD);
-    while (WiFi.status() != WL_CONNECTED) {
+    
+    int tentativas = 0;
+    while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
         delay(500);
         Serial.print(".");
+        tentativas++;
     }
-    Serial.println("\nWiFi conectado!");
-    Serial.println(WiFi.localIP());
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi OK!");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("\nFalha WiFi!");
+    }
 }
