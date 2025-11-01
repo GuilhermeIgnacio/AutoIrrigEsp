@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <PubSubClient.h> // Biblioteca MQTT
-#include <WiFiClientSecure.h> // Adicionado para TLS
+#include <PubSubClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 
 #include "sensor_dht.h"
@@ -11,21 +11,43 @@
 // --- Configurações de Rede ---
 const char* SSID = "guilherme_2G";
 const char* PASSWORD = "789453216a";
-const char* MQTT_BROKER = "d98fa3b64a654694be6a0cc7c5fa1799.s1.eu.hivemq.cloud"; // Exemplo: substitua pelo seu broker
-const int MQTT_PORT = 8883; // Porta padrão para MQTT não seguro
-const char* MQTT_CLIENT_ID = "ESP32_Irrigacao_01"; // Identificador único
-const char* MQTT_USER = "hivemq.webclient.1761853881390"; // Usuário (se necessário)
-const char* MQTT_PASS = "7G4#QF*ud&fey9S3:oYL"; // Senha (se necessário)
+const char* MQTT_BROKER = "d98fa3b64a654694be6a0cc7c5fa1799.s1.eu.hivemq.cloud";
+const int MQTT_PORT = 8883;
+const char* MQTT_CLIENT_ID = "ESP32_Irrigacao_01";
+const char* MQTT_USER = "hivemq.webclient.1761853881390";
+const char* MQTT_PASS = "7G4#QF*ud&fey9S3:oYL";
 
-// --- Tópicos MQTT ---
+// --- Tópicos MQTT Otimizados para HiveMQ Cloud ---
+// Usando estrutura hierárquica eficiente
 const char* TOPIC_TELEMETRIA = "irrigacao/telemetria";
 const char* TOPIC_COMANDOS = "irrigacao/commands";
-const char* TOPIC_BOMBAS = "irrigacao/bombas";
+const char* TOPIC_BOMBAS = "irrigacao/pump/status";
+const char* TOPIC_SENSORS = "irrigacao/sensor";
+const char* TOPIC_STATUS = "irrigacao/device/status";
+const char* TOPIC_LWT = "irrigacao/lwt"; // Last Will Testament
 
-// --- Intervalos Otimizados ---
-const unsigned long TELEMETRIA_INTERVAL = 10000; // 10s
-const unsigned long COMANDO_INTERVAL = 3000;     // 3s
-const unsigned long LOGICA_INTERVAL = 2000;      // 2s
+// --- Intervalos Otimizados para HiveMQ Cloud ---
+const unsigned long SENSOR_READ_INTERVAL = 1000;       // 1s - balanceado
+const unsigned long TELEMETRIA_INTERVAL = 5000;        // 5s - completo
+const unsigned long SENSOR_FAST_INTERVAL = 2000;       // 2s - mudanças rápidas
+const unsigned long LOGICA_INTERVAL = 1500;            // 1.5s - lógica
+const unsigned long HEARTBEAT_INTERVAL = 30000;        // 30s - heartbeat econômico
+const unsigned long MQTT_RECONNECT_DELAY = 5000;       // 5s entre reconexões
+
+// --- Limiares de Mudança ---
+const float TEMP_THRESHOLD = 0.5;
+const float HUMIDITY_AIR_THRESHOLD = 2.0;
+const int HUMIDITY_SOIL_THRESHOLD = 2;
+
+ // --- Configurações HiveMQ Cloud ---
+ const int MQTT_KEEPALIVE_INTERVAL = 60;           // 60s keepalive (padrão HiveMQ)
+ const int MQTT_SOCKET_TIMEOUT_SEC = 15;           // 15s timeout (nome alterado para evitar conflito)
+ const int MQTT_BUFFER_SIZE = 512;        // Buffer otimizado
+ const int MAX_RECONNECT_ATTEMPTS = 3;    // Tentativas por ciclo
+ const int QOS_TELEMETRY = 0;             // QoS 0 para telemetria (fire-and-forget)
+ const int QOS_COMMANDS = 1;              // QoS 1 para comandos (garantia)
+ const int QOS_STATUS = 1;                // QoS 1 para status
+ const bool RETAIN_STATUS = true;         // Retain para status do dispositivo
 
 // --- Controle de Estado ---
 struct SystemState {
@@ -40,11 +62,27 @@ struct SystemState {
     float last_umidadeAr = -999;
     int last_umidadeSolo[2] = {-1, -1};
     
+    // Leituras atuais
+    float current_temperatura = 0;
+    float current_umidadeAr = 0;
+    int current_umidadeSolo[2] = {0, 0};
+    
     // Cache de status das bombas
     bool last_bomba_ligada[2] = {false, false};
     
-    // Timestamp do último comando processado
+    // Controle de comandos
     String last_command_id = "";
+    
+    // Métricas para HiveMQ Cloud
+    unsigned long telemetry_count = 0;
+    unsigned long command_count = 0;
+    unsigned long mqtt_reconnects = 0;
+    unsigned long last_mqtt_error = 0;
+    
+    // Status de conexão
+    bool mqtt_connected = false;
+    bool wifi_connected = false;
+    unsigned long connection_start_time = 0;
 };
 
 SystemState state;
@@ -65,216 +103,365 @@ PubSubClient mqttClient(espClient);
 void setup_wifi();
 void setup_mqtt();
 void reconnect_mqtt();
-bool enviar_telemetria_otimizada();
+void read_sensors();
+bool enviar_telemetria_completa();
+bool enviar_sensores_rapido();
+bool enviar_status_sistema();
 void mqtt_callback(char* topic, byte* payload, unsigned int length);
-void verificar_comandos_otimizado();
 void handle_manual_irrigation();
 void logica_irrigacao();
-bool dados_telemetria_mudaram();
+bool sensor_data_changed_significantly();
 bool enviar_status_bomba_rapido(int bomba_index);
+void publish_lwt_online();
 
 void setup() {
     Serial.begin(115200);
+    delay(1000);
+    Serial.println("\n╔════════════════════════════════════════╗");
+    Serial.println("║  ESP32 Sistema de Irrigação HiveMQ    ║");
+    Serial.println("╚════════════════════════════════════════╝");
+    
     setupSensorDHT();
     setupSensorUmidadeSolo(PINO_UMIDADE_SOLO_1);
     setupSensorUmidadeSolo(PINO_UMIDADE_SOLO_2);
     setupBombas(PINO_BOMBA_1, PINO_BOMBA_2);
+    
     setup_wifi();
     setup_mqtt();
+    
+    // Leitura inicial
+    read_sensors();
+    state.connection_start_time = millis();
+    Serial.println("✓ Sistema inicializado!\n");
 }
 
 void loop() {
+    static unsigned long last_sensor_read = 0;
     static unsigned long last_telemetry_time = 0;
-    static unsigned long last_command_time = 0;
+    static unsigned long last_sensor_send = 0;
     static unsigned long last_logic_time = 0;
+    static unsigned long last_heartbeat = 0;
+    static unsigned long last_reconnect_attempt = 0;
 
     unsigned long now = millis();
 
-    // Mantém conexão MQTT
+    // Gerenciamento de conexão MQTT otimizado para HiveMQ Cloud
     if (!mqttClient.connected()) {
-        reconnect_mqtt();
+        if (now - last_reconnect_attempt >= MQTT_RECONNECT_DELAY) {
+            last_reconnect_attempt = now;
+            reconnect_mqtt();
+        }
+    } else {
+        mqttClient.loop(); // Processa mensagens apenas se conectado
     }
-    mqttClient.loop(); // Processa mensagens MQTT recebidas
 
-    // Envia telemetria se houver mudanças
-    if (now - last_telemetry_time > TELEMETRIA_INTERVAL) {
+    // 1. Lê sensores
+    if (now - last_sensor_read >= SENSOR_READ_INTERVAL) {
+        last_sensor_read = now;
+        read_sensors();
+    }
+
+    // 2. Envia dados de sensores se houver mudanças significativas
+    if (now - last_sensor_send >= SENSOR_FAST_INTERVAL) {
+        last_sensor_send = now;
+        if (state.mqtt_connected && sensor_data_changed_significantly()) {
+            enviar_sensores_rapido();
+        }
+    }
+
+    // 3. Envia telemetria completa periodicamente
+    if (now - last_telemetry_time >= TELEMETRIA_INTERVAL) {
         last_telemetry_time = now;
-        if (WiFi.status() == WL_CONNECTED && dados_telemetria_mudaram()) {
-            enviar_telemetria_otimizada();
+        if (state.mqtt_connected) {
+            enviar_telemetria_completa();
         }
     }
 
-    // Verifica comandos (mantido para compatibilidade, mas agora usa MQTT callback)
-    if (now - last_command_time > COMANDO_INTERVAL) {
-        last_command_time = now;
-        if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("WiFi desconectado. Tentando reconectar...");
-            setup_wifi();
-        }
+    // 4. Verifica WiFi
+    if (WiFi.status() != WL_CONNECTED && state.wifi_connected) {
+        Serial.println("⚠ WiFi desconectado!");
+        state.wifi_connected = false;
+        state.mqtt_connected = false;
+        setup_wifi();
     }
 
-    // Lógica local
-    if (now - last_logic_time > LOGICA_INTERVAL) {
+    // 5. Executa lógica de irrigação
+    if (now - last_logic_time >= LOGICA_INTERVAL) {
         last_logic_time = now;
         handle_manual_irrigation();
         logica_irrigacao();
     }
+
+    // 6. Envia heartbeat
+    if (now - last_heartbeat >= HEARTBEAT_INTERVAL) {
+        last_heartbeat = now;
+        if (state.mqtt_connected) {
+            enviar_status_sistema();
+        }
+    }
+
+    // Pequeno delay para watchdog
+    delay(10);
+}
+
+// --- Leitura de Sensores ---
+void read_sensors() {
+    state.current_temperatura = getTemperature();
+    state.current_umidadeAr = getAirHumidity();
+    state.current_umidadeSolo[0] = lerUmidadePercentual(PINO_UMIDADE_SOLO_1);
+    state.current_umidadeSolo[1] = lerUmidadePercentual(PINO_UMIDADE_SOLO_2);
+}
+
+// --- Verifica se dados mudaram significativamente ---
+bool sensor_data_changed_significantly() {
+    bool temp_changed = abs(state.current_temperatura - state.last_temperatura) >= TEMP_THRESHOLD;
+    bool air_hum_changed = abs(state.current_umidadeAr - state.last_umidadeAr) >= HUMIDITY_AIR_THRESHOLD;
+    bool soil1_changed = abs(state.current_umidadeSolo[0] - state.last_umidadeSolo[0]) >= HUMIDITY_SOIL_THRESHOLD;
+    bool soil2_changed = abs(state.current_umidadeSolo[1] - state.last_umidadeSolo[1]) >= HUMIDITY_SOIL_THRESHOLD;
+    
+    return temp_changed || air_hum_changed || soil1_changed || soil2_changed;
 }
 
 // --- Configuração WiFi ---
 void setup_wifi() {
     delay(10);
-    Serial.println("\nConectando WiFi...");
+    Serial.println("🔌 Conectando WiFi...");
+    WiFi.mode(WIFI_STA);
     WiFi.begin(SSID, PASSWORD);
+    WiFi.setAutoReconnect(true);
+    WiFi.setAutoConnect(true);
     
     int tentativas = 0;
-    while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
+    while (WiFi.status() != WL_CONNECTED && tentativas < 30) {
         delay(500);
         Serial.print(".");
         tentativas++;
     }
     
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\nWiFi OK!");
-        Serial.println(WiFi.localIP());
+        Serial.println("\n✓ WiFi Conectado!");
+        Serial.printf("  IP: %s\n", WiFi.localIP().toString().c_str());
+        Serial.printf("  RSSI: %d dBm\n", WiFi.RSSI());
+        state.wifi_connected = true;
     } else {
-        Serial.println("\nFalha WiFi!");
+        Serial.println("\n✗ Falha ao conectar WiFi!");
+        state.wifi_connected = false;
     }
 }
 
-// --- Configuração MQTT ---
-void setup_mqtt() {
-    espClient.setInsecure(); // Para teste (remova em produção)
-    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
-    mqttClient.setCallback(mqtt_callback);
-    reconnect_mqtt();
-}
+// --- Configuração MQTT Otimizada para HiveMQ Cloud ---
+ void setup_mqtt() {
+     // HiveMQ Cloud usa TLS, mas setInsecure para simplicidade
+     // Em produção, use certificados apropriados
+     espClient.setInsecure();
+     
+     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+     mqttClient.setCallback(mqtt_callback);
+     mqttClient.setKeepAlive(MQTT_KEEPALIVE_INTERVAL);
+     mqttClient.setSocketTimeout(MQTT_SOCKET_TIMEOUT_SEC);
+     mqttClient.setBufferSize(MQTT_BUFFER_SIZE);
+     
+     Serial.println("📡 Configuração MQTT concluída");
+     reconnect_mqtt();
+ }
 
-// --- Reconexão MQTT ---
+// --- Reconexão MQTT Otimizada ---
 void reconnect_mqtt() {
-    while (!mqttClient.connected()) {
-        Serial.println("Conectando ao MQTT Broker...");
-        Serial.printf("Tentando conectar a %s:%d com Client ID: %s\n", MQTT_BROKER, MQTT_PORT, MQTT_CLIENT_ID);
-        if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
-            Serial.println("MQTT Conectado!");
-            mqttClient.subscribe(TOPIC_COMANDOS);
+    if (!state.wifi_connected) return;
+    
+    int tentativas = 0;
+    while (!mqttClient.connected() && tentativas < MAX_RECONNECT_ATTEMPTS) {
+        Serial.printf("🔄 Conectando HiveMQ Cloud (tentativa %d/%d)...\n", 
+                     tentativas + 1, MAX_RECONNECT_ATTEMPTS);
+        
+        // Last Will Testament - notifica se dispositivo desconectar inesperadamente
+        if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS,
+                              TOPIC_LWT, QOS_STATUS, RETAIN_STATUS, "{\"status\":\"offline\"}")) {
+            Serial.println("✓ MQTT Conectado!");
+            state.mqtt_connected = true;
+            state.mqtt_reconnects++;
+            
+            // Subscreve aos comandos com QoS 1
+            mqttClient.subscribe(TOPIC_COMANDOS, QOS_COMMANDS);
+            Serial.printf("✓ Subscrito em: %s\n", TOPIC_COMANDOS);
+            
+            // Publica status online
+            publish_lwt_online();
+            
+            // Envia telemetria inicial
+            enviar_status_sistema();
+            enviar_telemetria_completa();
+            
+            return;
         } else {
-            Serial.print("Falha, rc=");
-            Serial.print(mqttClient.state());
-            Serial.println(" Tentando novamente em 5s...");
-            delay(5000);
+            int rc = mqttClient.state();
+            Serial.printf("✗ Falha MQTT, rc=%d\n", rc);
+            state.last_mqtt_error = rc;
+            
+            // Códigos de erro comuns HiveMQ Cloud:
+            // -4: Connection timeout
+            // -2: Connect failed
+            // 5: Connection refused (auth failed)
+            
+            if (rc == 5) {
+                Serial.println("  → Erro de autenticação. Verifique credenciais!");
+                break; // Não tenta mais se credenciais estão erradas
+            }
+            
+            tentativas++;
+            if (tentativas < MAX_RECONNECT_ATTEMPTS) {
+                delay(2000);
+            }
         }
     }
-}
-
-// --- Verifica se dados mudaram significativamente ---
-bool dados_telemetria_mudaram() {
-    float temp = getTemperature();
-    float umid_ar = getAirHumidity();
-    int umid_solo1 = lerUmidadePercentual(PINO_UMIDADE_SOLO_1);
-    int umid_solo2 = lerUmidadePercentual(PINO_UMIDADE_SOLO_2);
     
-    bool mudou_sensores = (abs(temp - state.last_temperatura) > 1.0) ||
-                          (abs(umid_ar - state.last_umidadeAr) > 1.0) ||
-                          (abs(umid_solo1 - state.last_umidadeSolo[0]) > 2) ||
-                          (abs(umid_solo2 - state.last_umidadeSolo[1]) > 2);
-    
-    bool mudou_bombas = (state.bomba_ligada[0] != state.last_bomba_ligada[0]) ||
-                        (state.bomba_ligada[1] != state.last_bomba_ligada[1]);
-    
-    bool mudou = mudou_sensores || mudou_bombas;
-    
-    if (mudou) {
-        state.last_temperatura = temp;
-        state.last_umidadeAr = umid_ar;
-        state.last_umidadeSolo[0] = umid_solo1;
-        state.last_umidadeSolo[1] = umid_solo2;
-        state.last_bomba_ligada[0] = state.bomba_ligada[0];
-        state.last_bomba_ligada[1] = state.bomba_ligada[1];
-    }
-    
-    return mudou;
-}
-
-// --- Enviar Telemetria via MQTT ---
-bool enviar_telemetria_otimizada() {
     if (!mqttClient.connected()) {
-        Serial.println("MQTT desconectado - telemetria não enviada");
-        return false;
+        state.mqtt_connected = false;
     }
+}
 
+// --- Publica Status Online (LWT) ---
+void publish_lwt_online() {
     JsonDocument doc;
-    doc["temperatura"] = state.last_temperatura;
-    doc["umidadeAr"] = state.last_umidadeAr;
-    JsonArray umidadeSoloArray = doc["umidadeSolo"].to<JsonArray>();
-    umidadeSoloArray.add(state.last_umidadeSolo[0]);
-    umidadeSoloArray.add(state.last_umidadeSolo[1]);
-    doc["timestamp"] = millis();
+    doc["status"] = "online";
+    doc["ip"] = WiFi.localIP().toString();
+    doc["rssi"] = WiFi.RSSI();
+    doc["uptime"] = millis();
     
-    JsonArray bombasArray = doc["bombas"].to<JsonArray>();
-    bombasArray.add(state.bomba_ligada[0]);
-    bombasArray.add(state.bomba_ligada[1]);
+    String output;
+    serializeJson(doc, output);
+    
+    mqttClient.publish(TOPIC_LWT, output.c_str(), RETAIN_STATUS);
+}
+
+// --- Enviar Dados de Sensores Rápido ---
+bool enviar_sensores_rapido() {
+    if (!mqttClient.connected()) return false;
+
+    // Payload compacto para eficiência
+    JsonDocument doc;
+    doc["t"] = round(state.current_temperatura * 10) / 10.0; // 1 decimal
+    doc["h"] = round(state.current_umidadeAr);
+    JsonArray s = doc["s"].to<JsonArray>();
+    s.add(state.current_umidadeSolo[0]);
+    s.add(state.current_umidadeSolo[1]);
+    doc["ts"] = millis() / 1000; // Timestamp em segundos
 
     String output;
     serializeJson(doc, output);
 
-    bool success = mqttClient.publish(TOPIC_TELEMETRIA, output.c_str());
+    bool success = mqttClient.publish(TOPIC_SENSORS, output.c_str(), false); // QoS 0
     if (success) {
-        Serial.println("Telemetria enviada via MQTT!");
-    } else {
-        Serial.println("Erro ao enviar telemetria via MQTT");
+        state.last_temperatura = state.current_temperatura;
+        state.last_umidadeAr = state.current_umidadeAr;
+        state.last_umidadeSolo[0] = state.current_umidadeSolo[0];
+        state.last_umidadeSolo[1] = state.current_umidadeSolo[1];
     }
     return success;
 }
 
-// --- Enviar Status da Bomba via MQTT ---
+// --- Enviar Telemetria Completa ---
+bool enviar_telemetria_completa() {
+    if (!mqttClient.connected()) return false;
+
+    JsonDocument doc;
+    
+    // Dados dos sensores
+    JsonObject sensor = doc["sensor"].to<JsonObject>();
+    sensor["temp"] = round(state.current_temperatura * 10) / 10.0;
+    sensor["airHum"] = round(state.current_umidadeAr);
+    JsonArray soil = sensor["soil"].to<JsonArray>();
+    soil.add(state.current_umidadeSolo[0]);
+    soil.add(state.current_umidadeSolo[1]);
+    
+    // Status das bombas
+    JsonArray pumps = doc["pumps"].to<JsonArray>();
+    pumps.add(state.bomba_ligada[0]);
+    pumps.add(state.bomba_ligada[1]);
+    
+    // Configuração
+    JsonObject cfg = doc["config"].to<JsonObject>();
+    JsonArray cMin = cfg["min"].to<JsonArray>();
+    cMin.add(state.min_umidade[0]);
+    cMin.add(state.min_umidade[1]);
+    JsonArray cMax = cfg["max"].to<JsonArray>();
+    cMax.add(state.max_umidade[0]);
+    cMax.add(state.max_umidade[1]);
+    
+    // Metadata
+    doc["seq"] = state.telemetry_count++;
+    doc["uptime"] = millis() / 1000;
+
+    String output;
+    serializeJson(doc, output);
+
+    return mqttClient.publish(TOPIC_TELEMETRIA, output.c_str(), false); // QoS 0
+}
+
+// --- Enviar Status do Sistema ---
+bool enviar_status_sistema() {
+    if (!mqttClient.connected()) return false;
+
+    JsonDocument doc;
+    doc["online"] = true;
+    doc["uptime"] = millis() / 1000;
+    doc["wifi"] = WiFi.RSSI();
+    doc["heap"] = ESP.getFreeHeap();
+    doc["msgSent"] = state.telemetry_count;
+    doc["msgRecv"] = state.command_count;
+    doc["reconnects"] = state.mqtt_reconnects;
+
+    String output;
+    serializeJson(doc, output);
+
+    return mqttClient.publish(TOPIC_STATUS, output.c_str(), RETAIN_STATUS);
+}
+
+// --- Enviar Status da Bomba ---
 bool enviar_status_bomba_rapido(int bomba_index) {
-    if (!mqttClient.connected()) {
-        Serial.println("MQTT desconectado - status bomba não enviado");
-        return false;
-    }
+    if (!mqttClient.connected()) return false;
     
     JsonDocument doc;
-    JsonArray bombasArray = doc.to<JsonArray>();
-    bombasArray.add(state.bomba_ligada[0]);
-    bombasArray.add(state.bomba_ligada[1]);
+    JsonArray pumps = doc["pumps"].to<JsonArray>();
+    pumps.add(state.bomba_ligada[0]);
+    pumps.add(state.bomba_ligada[1]);
+    doc["changed"] = bomba_index;
+    doc["ts"] = millis() / 1000;
 
     String output;
     serializeJson(doc, output);
 
-    bool success = mqttClient.publish(TOPIC_BOMBAS, output.c_str());
-    if (success) {
-        Serial.printf("Status bomba %d enviado: %s\n", bomba_index + 1, state.bomba_ligada[bomba_index] ? "LIGADA" : "DESLIGADA");
-    } else {
-        Serial.printf("Erro envio status bomba %d\n", bomba_index + 1);
-    }
-    return success;
+    return mqttClient.publish(TOPIC_BOMBAS, output.c_str(), false); // QoS 0 para atualizações rápidas
 }
 
 // --- Callback para Mensagens MQTT ---
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     if (strcmp(topic, TOPIC_COMANDOS) != 0) return;
 
+    state.command_count++;
+    
     String message;
+    message.reserve(length);
     for (unsigned int i = 0; i < length; i++) {
         message += (char)payload[i];
     }
 
     JsonDocument doc;
-    if (deserializeJson(doc, message)) {
-        Serial.println("Erro ao parsear comando MQTT");
+    DeserializationError error = deserializeJson(doc, message);
+    if (error) {
+        Serial.printf("✗ Erro JSON: %s\n", error.c_str());
         return;
     }
 
     String command_id = doc["id"] | "";
     if (command_id.length() > 0 && command_id == state.last_command_id) {
-        return; // Comando já processado
+        return; // Comando duplicado
     }
 
     const char* type = doc["type"];
     if (!type) return;
 
-    Serial.printf("Processando comando MQTT: %s\n", type);
+    Serial.printf("→ CMD [%s]: %s\n", command_id.c_str(), type);
 
     if (strcmp(type, "config") == 0) {
         JsonArray minArray = doc["payload"]["min_umidade"].as<JsonArray>();
@@ -285,7 +472,8 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
             state.max_umidade[0] = maxArray[0];
             state.min_umidade[1] = minArray[1];
             state.max_umidade[1] = maxArray[1];
-            Serial.println("Config atualizada via MQTT!");
+            Serial.println("  ✓ Config atualizada");
+            enviar_telemetria_completa();
         }
 
     } else if (strcmp(type, "manual_irrigate") == 0) {
@@ -293,7 +481,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         if (bomba >= 1 && bomba <= 2) {
             int index = bomba - 1;
             if (!state.manual_irrigation_active[index]) {
-                Serial.printf("Irrigação manual bomba %d via MQTT\n", bomba);
+                Serial.printf("  ✓ Irrigação manual B%d\n", bomba);
                 state.manual_irrigation_active[index] = true;
                 state.manual_irrigation_start_time[index] = millis();
                 controlarBomba(bomba, true);
@@ -301,6 +489,21 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
                 enviar_status_bomba_rapido(index);
             }
         }
+        
+    } else if (strcmp(type, "stop") == 0) {
+        int bomba = doc["bomba"];
+        if (bomba >= 1 && bomba <= 2) {
+            int index = bomba - 1;
+            controlarBomba(bomba, false);
+            state.bomba_ligada[index] = false;
+            state.manual_irrigation_active[index] = false;
+            Serial.printf("  ✓ Bomba %d parada\n", bomba);
+            enviar_status_bomba_rapido(index);
+        }
+        
+    } else if (strcmp(type, "ping") == 0) {
+        // Resposta rápida a ping
+        enviar_status_sistema();
     }
 
     state.last_command_id = command_id;
@@ -312,7 +515,7 @@ void handle_manual_irrigation() {
         if (state.manual_irrigation_active[i]) {
             if (millis() - state.manual_irrigation_start_time[i] >= MANUAL_IRRIGATION_DURATION) {
                 int bomba_num = i + 1;
-                Serial.printf("Fim irrigação manual bomba %d\n", bomba_num);
+                Serial.printf("⏱ Fim irrigação manual B%d\n", bomba_num);
                 controlarBomba(bomba_num, false);
                 state.bomba_ligada[i] = false;
                 state.manual_irrigation_active[i] = false;
@@ -324,42 +527,28 @@ void handle_manual_irrigation() {
 
 // --- Lógica de Irrigação Automática ---
 void logica_irrigacao() {
-    int umidade_atual[] = {
-        lerUmidadePercentual(PINO_UMIDADE_SOLO_1),
-        lerUmidadePercentual(PINO_UMIDADE_SOLO_2)
-    };
-    
     for (int i = 0; i < 2; i++) {
+        if (state.manual_irrigation_active[i]) continue;
+        
         int bomba_num = i + 1;
+        int umidade = state.current_umidadeSolo[i];
         
-        Serial.printf("=== BOMBA %d ===\n", bomba_num);
-        Serial.printf("Umidade atual: %d%%\n", umidade_atual[i]);
-        Serial.printf("Min configurado: %d%%\n", state.min_umidade[i]);
-        Serial.printf("Max configurado: %d%%\n", state.max_umidade[i]);
-        Serial.printf("Manual ativo: %s\n", state.manual_irrigation_active[i] ? "SIM" : "NÃO");
-        Serial.printf("Bomba ligada: %s\n", state.bomba_ligada[i] ? "SIM" : "NÃO");
+        bool should_turn_on = umidade < state.min_umidade[i] && !state.bomba_ligada[i];
+        bool should_turn_off = umidade >= state.max_umidade[i] && state.bomba_ligada[i];
         
-        if (!state.manual_irrigation_active[i]) {
-            if (umidade_atual[i] < state.min_umidade[i] && !state.bomba_ligada[i]) {
-                Serial.printf(">>> LIGANDO bomba %d (umidade %d%% < min %d%%)\n", 
-                             bomba_num, umidade_atual[i], state.min_umidade[i]);
-                controlarBomba(bomba_num, true);
-                state.bomba_ligada[i] = true;
-                enviar_status_bomba_rapido(i);
-            } 
-            else if (umidade_atual[i] >= state.max_umidade[i] && state.bomba_ligada[i]) {
-                Serial.printf(">>> DESLIGANDO bomba %d (umidade %d%% >= max %d%%)\n", 
-                             bomba_num, umidade_atual[i], state.max_umidade[i]);
-                controlarBomba(bomba_num, false);
-                state.bomba_ligada[i] = false;
-                enviar_status_bomba_rapido(i);
-            }
-            else {
-                Serial.println(">>> Nenhuma ação necessária");
-            }
-        } else {
-            Serial.println(">>> MODO MANUAL - lógica automática pausada");
+        if (should_turn_on) {
+            Serial.printf("🔵 LIGA B%d (%d%% < %d%%)\n", 
+                         bomba_num, umidade, state.min_umidade[i]);
+            controlarBomba(bomba_num, true);
+            state.bomba_ligada[i] = true;
+            enviar_status_bomba_rapido(i);
+        } 
+        else if (should_turn_off) {
+            Serial.printf("🔴 DESLIGA B%d (%d%% >= %d%%)\n", 
+                         bomba_num, umidade, state.max_umidade[i]);
+            controlarBomba(bomba_num, false);
+            state.bomba_ligada[i] = false;
+            enviar_status_bomba_rapido(i);
         }
-        Serial.println();
     }
 }
