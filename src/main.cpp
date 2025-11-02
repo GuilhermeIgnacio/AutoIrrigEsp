@@ -39,15 +39,15 @@ const float TEMP_THRESHOLD = 0.5;
 const float HUMIDITY_AIR_THRESHOLD = 2.0;
 const int HUMIDITY_SOIL_THRESHOLD = 2;
 
- // --- Configurações HiveMQ Cloud ---
- const int MQTT_KEEPALIVE_INTERVAL = 60;           // 60s keepalive (padrão HiveMQ)
- const int MQTT_SOCKET_TIMEOUT_SEC = 15;           // 15s timeout (nome alterado para evitar conflito)
- const int MQTT_BUFFER_SIZE = 512;        // Buffer otimizado
- const int MAX_RECONNECT_ATTEMPTS = 3;    // Tentativas por ciclo
- const int QOS_TELEMETRY = 0;             // QoS 0 para telemetria (fire-and-forget)
- const int QOS_COMMANDS = 1;              // QoS 1 para comandos (garantia)
- const int QOS_STATUS = 1;                // QoS 1 para status
- const bool RETAIN_STATUS = true;         // Retain para status do dispositivo
+// --- Configurações HiveMQ Cloud ---
+const int HIVE_MQTT_KEEPALIVE = 60;           // 60s keepalive (padrão HiveMQ)
+const int HIVE_MQTT_SOCKET_TIMEOUT = 15;      // 15s timeout
+const int MQTT_BUFFER_SIZE = 512;        // Buffer otimizado
+const int MAX_RECONNECT_ATTEMPTS = 3;    // Tentativas por ciclo
+const int QOS_TELEMETRY = 0;             // QoS 0 para telemetria (fire-and-forget)
+const int QOS_COMMANDS = 1;              // QoS 1 para comandos (garantia)
+const int QOS_STATUS = 1;                // QoS 1 para status
+const bool RETAIN_STATUS = true;         // Retain para status do dispositivo
 
 // --- Controle de Estado ---
 struct SystemState {
@@ -250,20 +250,20 @@ void setup_wifi() {
 }
 
 // --- Configuração MQTT Otimizada para HiveMQ Cloud ---
- void setup_mqtt() {
-     // HiveMQ Cloud usa TLS, mas setInsecure para simplicidade
-     // Em produção, use certificados apropriados
-     espClient.setInsecure();
-     
-     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
-     mqttClient.setCallback(mqtt_callback);
-     mqttClient.setKeepAlive(MQTT_KEEPALIVE_INTERVAL);
-     mqttClient.setSocketTimeout(MQTT_SOCKET_TIMEOUT_SEC);
-     mqttClient.setBufferSize(MQTT_BUFFER_SIZE);
-     
-     Serial.println("📡 Configuração MQTT concluída");
-     reconnect_mqtt();
- }
+void setup_mqtt() {
+    // HiveMQ Cloud usa TLS, mas setInsecure para simplicidade
+    // Em produção, use certificados apropriados
+    espClient.setInsecure();
+    
+    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+    mqttClient.setCallback(mqtt_callback);
+    mqttClient.setKeepAlive(HIVE_MQTT_KEEPALIVE);
+    mqttClient.setSocketTimeout(HIVE_MQTT_SOCKET_TIMEOUT);
+    mqttClient.setBufferSize(MQTT_BUFFER_SIZE);
+    
+    Serial.println("📡 Configuração MQTT concluída");
+    reconnect_mqtt();
+}
 
 // --- Reconexão MQTT Otimizada ---
 void reconnect_mqtt() {
@@ -477,28 +477,97 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         }
 
     } else if (strcmp(type, "manual_irrigate") == 0) {
-        int bomba = doc["bomba"];
-        if (bomba >= 1 && bomba <= 2) {
-            int index = bomba - 1;
-            if (!state.manual_irrigation_active[index]) {
-                Serial.printf("  ✓ Irrigação manual B%d\n", bomba);
-                state.manual_irrigation_active[index] = true;
-                state.manual_irrigation_start_time[index] = millis();
-                controlarBomba(bomba, true);
-                state.bomba_ligada[index] = true;
-                enviar_status_bomba_rapido(index);
+        // Suporta bomba individual ou múltiplas bombas
+        bool hasIndividual = doc.containsKey("bomba");
+        bool hasMultiple = doc.containsKey("bombas");
+        
+        if (hasIndividual) {
+            // Bomba individual
+            int bomba = doc["bomba"];
+            if (bomba >= 1 && bomba <= 2) {
+                int index = bomba - 1;
+                if (!state.manual_irrigation_active[index]) {
+                    Serial.printf("  ✓ Irrigação manual B%d\n", bomba);
+                    state.manual_irrigation_active[index] = true;
+                    state.manual_irrigation_start_time[index] = millis();
+                    controlarBomba(bomba, true);
+                    state.bomba_ligada[index] = true;
+                    enviar_status_bomba_rapido(index);
+                }
+            }
+        }
+        
+        if (hasMultiple) {
+            // Múltiplas bombas
+            JsonArray bombasArray = doc["bombas"].as<JsonArray>();
+            Serial.printf("  ✓ Irrigação manual múltipla: ");
+            
+            for (JsonVariant v : bombasArray) {
+                int bomba = v.as<int>();
+                if (bomba >= 1 && bomba <= 2) {
+                    int index = bomba - 1;
+                    Serial.printf("B%d ", bomba);
+                    
+                    if (!state.manual_irrigation_active[index]) {
+                        state.manual_irrigation_active[index] = true;
+                        state.manual_irrigation_start_time[index] = millis();
+                        controlarBomba(bomba, true);
+                        state.bomba_ligada[index] = true;
+                    }
+                }
+            }
+            Serial.println();
+            
+            // Envia status de ambas as bombas após atualizar todas
+            for (int i = 0; i < 2; i++) {
+                if (state.bomba_ligada[i]) {
+                    enviar_status_bomba_rapido(i);
+                    delay(10); // Pequeno delay entre publicações
+                }
             }
         }
         
     } else if (strcmp(type, "stop") == 0) {
-        int bomba = doc["bomba"];
-        if (bomba >= 1 && bomba <= 2) {
-            int index = bomba - 1;
-            controlarBomba(bomba, false);
-            state.bomba_ligada[index] = false;
-            state.manual_irrigation_active[index] = false;
-            Serial.printf("  ✓ Bomba %d parada\n", bomba);
-            enviar_status_bomba_rapido(index);
+        // Suporta bomba individual ou múltiplas bombas
+        bool hasIndividual = doc.containsKey("bomba");
+        bool hasMultiple = doc.containsKey("bombas");
+        
+        if (hasIndividual) {
+            // Bomba individual
+            int bomba = doc["bomba"];
+            if (bomba >= 1 && bomba <= 2) {
+                int index = bomba - 1;
+                controlarBomba(bomba, false);
+                state.bomba_ligada[index] = false;
+                state.manual_irrigation_active[index] = false;
+                Serial.printf("  ✓ Bomba %d parada\n", bomba);
+                enviar_status_bomba_rapido(index);
+            }
+        }
+        
+        if (hasMultiple) {
+            // Múltiplas bombas
+            JsonArray bombasArray = doc["bombas"].as<JsonArray>();
+            Serial.printf("  ✓ Parada múltipla: ");
+            
+            for (JsonVariant v : bombasArray) {
+                int bomba = v.as<int>();
+                if (bomba >= 1 && bomba <= 2) {
+                    int index = bomba - 1;
+                    Serial.printf("B%d ", bomba);
+                    
+                    controlarBomba(bomba, false);
+                    state.bomba_ligada[index] = false;
+                    state.manual_irrigation_active[index] = false;
+                }
+            }
+            Serial.println();
+            
+            // Envia status de ambas as bombas
+            for (int i = 0; i < 2; i++) {
+                enviar_status_bomba_rapido(i);
+                delay(10);
+            }
         }
         
     } else if (strcmp(type, "ping") == 0) {
