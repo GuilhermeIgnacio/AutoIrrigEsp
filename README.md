@@ -32,6 +32,60 @@ O sistema se integra com a nuvem através do protocolo MQTT (utilizando HiveMQ C
     *   Bomba 2: GPIO 27
 *   **Sensor DHT:** (Pino não especificado no `main.cpp`, mas configurado via `setupSensorDHT()`)
 
+## Configuração
+
+Todas as configurações principais do firmware estão centralizadas no início do arquivo `src/main.cpp`.
+
+### Rede WiFi
+
+Para conectar o ESP32 à sua rede, altere as seguintes constantes:
+
+```cpp
+const char* SSID = "SEU_WIFI_SSID";
+const char* PASSWORD = "SUA_SENHA_WIFI";
+```
+
+### Broker MQTT
+
+O projeto está pré-configurado para usar o HiveMQ Cloud, mas pode ser adaptado para qualquer broker MQTT.
+
+```cpp
+const char* MQTT_BROKER = "SEU_BROKER_URL";
+const int MQTT_PORT = 8883; // Porta padrão para MQTT seguro
+const char* MQTT_CLIENT_ID = "ESP32_Irrigacao_01";
+const char* MQTT_USER = "SEU_USUARIO_MQTT";
+const char* MQTT_PASS = "SUA_SENHA_MQTT";
+```
+
+### Tópicos MQTT
+
+Os tópicos seguem uma estrutura hierárquica e podem ser ajustados conforme necessário:
+
+```cpp
+const char* TOPIC_TELEMETRIA = "irrigacao/telemetria";
+const char* TOPIC_COMANDOS = "irrigacao/commands";
+const char* TOPIC_BOMBAS = "irrigacao/pump/status";
+const char* TOPIC_SENSORS = "irrigacao/sensor";
+const char* TOPIC_STATUS = "irrigacao/device/status";
+const char* TOPIC_LWT = "irrigacao/lwt"; // Last Will Testament
+```
+
+### Intervalos e Limiares
+
+Você pode ajustar a frequência das leituras e publicações, bem como os limiares de sensibilidade para o envio de dados.
+
+```cpp
+// Intervalos em milissegundos
+const unsigned long SENSOR_READ_INTERVAL = 1000;       // Leitura de sensores
+const unsigned long TELEMETRIA_INTERVAL = 5000;        // Envio de telemetria completa
+const unsigned long HEARTBEAT_INTERVAL = 30000;        // Envio de status do dispositivo
+
+// Limiares de mudança para envio rápido de dados
+const float TEMP_THRESHOLD = 0.5;
+const float HUMIDITY_AIR_THRESHOLD = 2.0;
+const int HUMIDITY_SOIL_THRESHOLD = 2;
+```
+
 ## Estrutura do Projeto
 
 *   **`platformio.ini`**: Arquivo de configuração do PlatformIO, definindo a plataforma (ESP32), framework (Arduino) e dependências de bibliotecas (DHT sensor library, Adafruit Unified Sensor, ArduinoJson, PubSubClient).
